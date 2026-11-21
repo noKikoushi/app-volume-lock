@@ -8,8 +8,8 @@ use windows::core::{w, Interface, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::Registry::*;
-use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, MessageBoxW, PostMessageW, IDYES, MB_ICONQUESTION, MB_YESNO, WM_CLOSE};
+use windows::Win32::UI::Shell::{IShellLinkW, ShellExecuteW, ShellLink};
+use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, MessageBoxW, PostMessageW, IDYES, MB_ICONQUESTION, MB_YESNO, SW_SHOWNORMAL, WM_CLOSE};
 
 const RUN: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const UNINSTALL: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\AppVolumeLock";
@@ -69,7 +69,8 @@ pub fn install_if_needed(class: PCWSTR) -> bool {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    std::process::Command::new(&target).arg(INSTALLED_ARG).spawn().is_ok()
+    let started = unsafe { ShellExecuteW(None, w!("open"), &HSTRING::from(target.as_os_str()), &HSTRING::from(INSTALLED_ARG), None, SW_SHOWNORMAL) };
+    started.0 as isize > 32 // ShellExecute reports success with a value above 32
 }
 
 fn set_value(key: &str, name: &str, value: &str) {
@@ -131,17 +132,15 @@ pub fn uninstall(class: PCWSTR) {
         let _ = std::fs::remove_file(PathBuf::from(appdata).join("Microsoft\\Windows\\Start Menu\\Programs\\App Volume Lock.lnk"));
     }
     let _ = std::fs::remove_dir_all(crate::settings::dir());
-    // this exe is still running, so its folder is removed a moment after it exits
+    // A running exe can't be deleted, but it can be moved: put it in the temp folder
+    // (Windows clears that on its own), then the program folder is empty and goes too.
     let dir = install_dir();
-    if dir.exists() {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = std::process::Command::new("cmd")
-            .args(["/c", "ping", "-n", "3", "127.0.0.1", ">nul", "&", "rmdir", "/s", "/q"])
-            .arg(&dir)
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn();
+    if let Ok(me) = std::env::current_exe() {
+        if me.starts_with(&dir) {
+            let _ = std::fs::rename(&me, std::env::temp_dir().join("AppVolumeLock-removed.exe"));
+        }
     }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 pub fn set(enable: bool) {
