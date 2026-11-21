@@ -50,12 +50,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $notes = @"
-          Download **AppVolumeLock.exe** below and run it. It installs itself for your user (no admin rights) and opens next to the tray. Running a newer download updates it.
+          ## Installation
 
-          If Windows shows "Windows protected your PC", click **More info → Run anyway** (see [Security and privacy](https://github.com/${{ github.repository }}#security-and-privacy)).
+          Download ``AppVolumeLock.exe`` from the assets below and run it. The application installs itself for the current user (no administrator rights required) and opens next to the notification area. Running a newer release updates an existing installation.
 
-          Built by GitHub Actions from this tag, with a build attestation (``gh attestation verify AppVolumeLock.exe -R ${{ github.repository }}``).
-          SHA256: ``$env:HASH``
-          VirusTotal: (link added after publishing)
+          The executable is not code-signed, so Windows SmartScreen may display *Windows protected your PC*. Select **More info → Run anyway**. See [Security and privacy](https://github.com/${{ github.repository }}#security-and-privacy).
+
+          ## Changes
+
+          (to be added)
+
+          ## Verification
+
+          | | |
+          |---|---|
+          | SHA256 | ``$env:HASH`` |
+          | Build attestation | ``gh attestation verify AppVolumeLock.exe --repo ${{ github.repository }}`` |
+          | VirusTotal | Pending |
+
+          Built by GitHub Actions from this tag.
           "@
           gh release create "${{ github.ref_name }}" dist/AppVolumeLock.exe dist/AppVolumeLock.exe.sha256 --title "App Volume Lock ${{ github.ref_name }}" --notes "$notes"
