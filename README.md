@@ -126,7 +126,7 @@ Where things go:
 ## Why Rust
 
 - One small exe (about 500 KB) with nothing else to install: no .NET, no Electron.
-- About 4 MB of memory and practically no CPU while it waits in the tray.
+- About 16 MB of memory and practically no CPU while it waits in the tray.
 - It talks to Windows' audio API directly, and Rust's checks rule out a whole class of memory bugs.
 
 ## Build from source
