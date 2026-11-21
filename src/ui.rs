@@ -1844,9 +1844,15 @@ pub fn run() {
             return;
         }
         // started from a download: install (or update) and let the installed copy run
-        if !cfg!(debug_assertions) && startup::install_if_needed(CLASS) {
-            return;
-        }
+        let installed = if cfg!(debug_assertions) {
+            false // development builds run from where they are and register nothing
+        } else {
+            match startup::install_if_needed(CLASS) {
+                startup::Install::Started => return,
+                startup::Install::Here => true,
+                startup::Install::Failed => false,
+            }
+        };
         let _mutex = CreateMutexW(None, true, w!("Local\\AppVolumeLock.Instance"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
             // already running: open its flyout instead
@@ -1857,8 +1863,11 @@ pub fn run() {
         }
         let settings = settings::load();
         SHOW_SYS.store(settings.show_system_sounds, Relaxed);
-        startup::set(settings.start_with_windows); // also follows the exe if it was moved
-        startup::register();
+        // only the installed copy points the Start menu, Settings → Apps and sign-in at itself
+        if installed {
+            startup::set(settings.start_with_windows);
+            startup::register();
+        }
         let at_sign_in = has(startup::STARTUP_ARG);
         let just_installed = has(startup::INSTALLED_ARG);
         {

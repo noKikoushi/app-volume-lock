@@ -49,28 +49,41 @@ pub fn close_running(class: PCWSTR) {
     }
 }
 
-/// Run from anywhere else (Downloads …): copy this exe into place, start that copy and
-/// return true so this one exits. Running a newer download updates the installed copy.
-pub fn install_if_needed(class: PCWSTR) -> bool {
-    let Ok(me) = std::env::current_exe() else { return false };
+pub enum Install {
+    /// this is the installed copy: carry on normally
+    Here,
+    /// the installed copy was (re)placed and started: this one should exit
+    Started,
+    /// couldn't install: run from where we are, but don't register this location
+    Failed,
+}
+
+/// Run from anywhere else (Downloads …): copy this exe into place and start that copy.
+/// Running a newer download updates the installed copy.
+pub fn install_if_needed(class: PCWSTR) -> Install {
+    let Ok(me) = std::env::current_exe() else { return Install::Failed };
     let target = installed_exe();
     if same_file(&me, &target) {
-        return false;
+        return Install::Here;
     }
     close_running(class);
     if std::fs::create_dir_all(install_dir()).is_err() {
-        return false;
+        return Install::Failed;
     }
-    // the old copy may need a moment to let go of its file
+    // Copy next to it first, then swap it in with one rename, so a failed copy (disk
+    // full …) never leaves a broken exe behind. The old copy may need a moment to let go.
+    let fresh = target.with_extension("exe.new");
     let t0 = Instant::now();
-    while std::fs::copy(&me, &target).is_err() {
+    while std::fs::copy(&me, &fresh).is_err() || std::fs::rename(&fresh, &target).is_err() {
         if t0.elapsed() > Duration::from_secs(5) {
-            return false; // couldn't install: just run from where we are
+            let _ = std::fs::remove_file(&fresh);
+            return Install::Failed;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     let started = unsafe { ShellExecuteW(None, w!("open"), &HSTRING::from(target.as_os_str()), &HSTRING::from(INSTALLED_ARG), None, SW_SHOWNORMAL) };
-    started.0 as isize > 32 // ShellExecute reports success with a value above 32
+    // ShellExecute reports success with a value above 32
+    if started.0 as isize > 32 { Install::Started } else { Install::Failed }
 }
 
 fn set_value(key: &str, name: &str, value: &str) {
@@ -137,7 +150,8 @@ pub fn uninstall(class: PCWSTR) {
     let dir = install_dir();
     if let Ok(me) = std::env::current_exe() {
         if me.starts_with(&dir) {
-            let _ = std::fs::rename(&me, std::env::temp_dir().join("AppVolumeLock-removed.exe"));
+            let parked = std::env::temp_dir().join(format!("AppVolumeLock-removed-{}.exe", std::process::id()));
+            let _ = std::fs::rename(&me, parked);
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
