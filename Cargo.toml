@@ -1,6 +1,6 @@
 [package]
 name = "app-volume-lock"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 description = "Windows forgets an app's volume when the app updates. This puts it back and keeps it where you set it."
 license = "GPL-3.0-only"

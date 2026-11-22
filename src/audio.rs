@@ -75,11 +75,24 @@ pub fn start() {
     std::thread::spawn(|| unsafe { worker() });
 }
 
+/// A session object handed over from a callback thread to the worker. Audio session
+/// objects are free-threaded and both sides run in the multithreaded apartment.
+struct Handover(IAudioSessionControl);
+unsafe impl Send for Handover {}
+
+/// Sessions that appeared since the last pass: (device id, session)
+static CREATED: Mutex<Vec<(String, Handover)>> = Mutex::new(Vec::new());
+
 #[implement(IAudioSessionNotification)]
-struct SessionNotify;
+struct SessionNotify {
+    device: String,
+}
 
 impl IAudioSessionNotification_Impl for SessionNotify_Impl {
-    fn OnSessionCreated(&self, _new: Option<&IAudioSessionControl>) -> Result<()> {
+    fn OnSessionCreated(&self, new: Option<&IAudioSessionControl>) -> Result<()> {
+        if let Some(c) = new {
+            CREATED.lock().unwrap().push((self.device.clone(), Handover(c.clone())));
+        }
         wake();
         Ok(())
     }
@@ -148,9 +161,52 @@ impl IMMNotificationClient_Impl for DeviceEvents_Impl {
     }
 }
 
+/// An output device and the sessions on it, by session instance id.
+///
+/// The sessions are kept rather than listed again on every pass: while sessions have
+/// events registered, every new list (IAudioSessionEnumerator) leaks a few KB inside
+/// Windows' audio client that is never given back, and a pass can run many times a
+/// second. New sessions come from OnSessionCreated; a full list is taken only when the
+/// device is set up and every few minutes as a safety net.
 struct Device {
     id: String,
     mgr: IAudioSessionManager2,
+    notify: IAudioSessionNotification,
+    sessions: HashMap<String, IAudioSessionControl>,
+}
+
+impl Device {
+    unsafe fn add(&mut self, c: IAudioSessionControl) {
+        if let Some(id) = instance_id(&c) {
+            self.sessions.entry(id).or_insert(c);
+        }
+    }
+
+    unsafe fn list_all(&mut self) {
+        let Ok(en) = self.mgr.GetSessionEnumerator() else { return };
+        for i in 0..en.GetCount().unwrap_or(0) {
+            if let Ok(c) = en.GetSession(i) {
+                self.add(c);
+            }
+        }
+    }
+
+    /// Drops sessions that are over (see `tidy`).
+    unsafe fn prune(&mut self) {
+        self.sessions.retain(|_, c| !over(c));
+    }
+}
+
+unsafe fn instance_id(c: &IAudioSessionControl) -> Option<String> {
+    let c2 = c.cast::<IAudioSessionControl2>().ok()?;
+    Some(pwstr_take(c2.GetSessionInstanceIdentifier().ok()?))
+}
+
+/// The session expired, or its process has exited.
+unsafe fn over(c: &IAudioSessionControl) -> bool {
+    let expired = c.GetState().map_or(true, |s| s == AudioSessionStateExpired);
+    let pid = c.cast::<IAudioSessionControl2>().and_then(|c2| c2.GetProcessId()).unwrap_or(0);
+    expired || (pid != 0 && !running(pid))
 }
 
 unsafe fn pwstr_take(p: PWSTR) -> String {
@@ -362,7 +418,6 @@ impl Names {
 unsafe fn worker() {
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     let ev = HANDLE(WAKE.load(Relaxed) as _);
-    let notify: IAudioSessionNotification = SessionNotify.into();
     let events: IAudioSessionEvents = VolumeEvents.into();
     let mut en: Option<IMMDeviceEnumerator> = None;
     let mut devices: Vec<Device> = vec![];
@@ -370,6 +425,8 @@ unsafe fn worker() {
     let mut names = Names::new();
     let mut found: HashMap<String, String> = HashMap::new();
     let mut checked: Option<Instant> = None;
+    let mut listed = Instant::now();
+    let mut clean_at = 64;
     let device_events: IMMNotificationClient = DeviceEvents.into();
     loop {
         if en.is_none() {
@@ -403,19 +460,24 @@ unsafe fn worker() {
                     let same = list.len() == devices.len() && list.iter().zip(&devices).all(|(a, b)| a.0 == b.id);
                     if !same {
                         for d in &devices {
-                            let _ = d.mgr.UnregisterSessionNotification(&notify);
+                            let _ = d.mgr.UnregisterSessionNotification(&d.notify);
                         }
                         for (_, c) in hooked.drain() {
                             let _ = c.UnregisterAudioSessionNotification(&events);
                         }
                         devices.clear();
+                        CREATED.lock().unwrap().clear();
                         for (id, dev) in list {
                             let Ok(mgr) = dev.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else { continue };
+                            let notify: IAudioSessionNotification = SessionNotify { device: id.clone() }.into();
                             // Windows only sends "session created" after the list was asked for once
                             let _ = mgr.GetSessionEnumerator();
                             let _ = mgr.RegisterSessionNotification(&notify);
-                            devices.push(Device { id, mgr });
+                            let mut d = Device { id, mgr, notify, sessions: HashMap::new() };
+                            d.list_all();
+                            devices.push(d);
                         }
+                        listed = Instant::now();
                     }
                 }
                 Err(_) => {
@@ -424,19 +486,59 @@ unsafe fn worker() {
                     en = None;
                 }
             }
-            // forget sessions that are gone for good
-            hooked.retain(|_, c| {
-                let alive = c.GetState().map_or(false, |s| s != AudioSessionStateExpired);
-                if !alive {
-                    let _ = c.UnregisterAudioSessionNotification(&events);
-                }
-                alive
-            });
+            clean_at = tidy(&mut devices, &mut hooked, &events);
+        }
+        // safety net, in case a "session created" was missed
+        if listed.elapsed() > Duration::from_secs(300) {
+            listed = Instant::now();
+            for d in &mut devices {
+                d.list_all();
+            }
+        }
+        for (dev, Handover(c)) in std::mem::take(&mut *CREATED.lock().unwrap()) {
+            if let Some(d) = devices.iter_mut().find(|d| d.id == dev) {
+                d.add(c);
+            }
+        }
+        // many short-lived sessions (an app opening and closing streams fast): clean up now
+        if devices.iter().map(|d| d.sessions.len()).sum::<usize>().max(hooked.len()) > clean_at {
+            clean_at = tidy(&mut devices, &mut hooked, &events);
         }
         let default_id = e.GetDefaultAudioEndpoint(eRender, eConsole).ok().and_then(|d| d.GetId().ok()).map(|p| pwstr_take(p));
         apply(&devices, &mut hooked, &mut names, &events, &found, default_id.as_deref());
         let _ = WaitForSingleObject(ev, 2000);
     }
+}
+
+/// Lets go of sessions that are over. Holding on to one keeps it from ever expiring
+/// (Windows keeps it, and it stays in every session list), so a session also counts as
+/// over once its process has exited. Returns the size at which to tidy up again.
+unsafe fn tidy(devices: &mut [Device], hooked: &mut HashMap<String, IAudioSessionControl>, events: &IAudioSessionEvents) -> usize {
+    for d in devices.iter_mut() {
+        d.prune();
+    }
+    hooked.retain(|_, c| {
+        let ended = over(c);
+        if ended {
+            let _ = c.UnregisterAudioSessionNotification(events);
+        }
+        !ended
+    });
+    let known: usize = devices.iter().map(|d| d.sessions.len()).sum();
+    known.max(hooked.len()).max(32) * 2
+}
+
+/// Whether a process still runs. One we may not open (protected, e.g. by an anti-cheat)
+/// counts as running; only "no such process" means it's gone.
+unsafe fn running(pid: u32) -> bool {
+    let h = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+        Ok(h) => h,
+        Err(e) => return e.code() != ERROR_INVALID_PARAMETER.to_hresult(),
+    };
+    let mut code = 0u32;
+    let ok = GetExitCodeProcess(h, &mut code).is_ok();
+    let _ = CloseHandle(h);
+    ok && code == STILL_ACTIVE.0 as u32
 }
 
 /// One entry per app, even when it plays through several programs or sessions
@@ -466,13 +568,18 @@ fn target(mode: Mode, want: f32, cur: f32, once: bool) -> Option<f32> {
     }
 }
 
-/// If another program keeps setting the same app to a different volume, the two would
-/// undo each other endlessly. After 10 corrections within a second, stop for the rest of
-/// that second (the 2 s check still holds the lock, without burning CPU).
-fn may_correct(key: &str) -> bool {
+/// If another program keeps setting the same session to a different volume, the two
+/// would undo each other endlessly. After 10 corrections of one session within a second,
+/// stop for the rest of that second (the 2 s check still holds the lock, without burning
+/// CPU). Counted per session, not per app: an app opening many sessions at once
+/// (browser tabs …) still gets each of them fixed right away.
+fn may_correct(session: &str) -> bool {
     static SEEN: LazyLock<Mutex<HashMap<String, (Instant, u32)>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
     let mut m = SEEN.lock().unwrap();
-    let e = m.entry(key.to_string()).or_insert((Instant::now(), 0));
+    if m.len() > 256 {
+        m.retain(|_, (t, _)| t.elapsed() <= Duration::from_secs(1));
+    }
+    let e = m.entry(session.to_string()).or_insert((Instant::now(), 0));
     if e.0.elapsed() > Duration::from_secs(1) {
         *e = (Instant::now(), 0);
     }
@@ -481,20 +588,15 @@ fn may_correct(key: &str) -> bool {
 }
 
 /// Applies one rule to one session; returns its volume afterwards.
-unsafe fn enforce(ctl: &IAudioSessionControl, vol: &ISimpleAudioVolume, key: &str, cfg: (u32, Mode), once: &HashSet<String>, unmute: &HashSet<String>, hooked: &mut HashMap<String, IAudioSessionControl>, events: &IAudioSessionEvents) -> Option<f32> {
+unsafe fn enforce(id: &str, ctl: &IAudioSessionControl, vol: &ISimpleAudioVolume, key: &str, cfg: (u32, Mode), once: &HashSet<String>, unmute: &HashSet<String>, hooked: &mut HashMap<String, IAudioSessionControl>, events: &IAudioSessionEvents) -> Option<f32> {
     // listen to this session's volume so a change is undone at once
-    if let Ok(c2) = ctl.cast::<IAudioSessionControl2>() {
-        if let Ok(id) = c2.GetSessionInstanceIdentifier() {
-            let id = pwstr_take(id);
-            if !hooked.contains_key(&id) && ctl.RegisterAudioSessionNotification(events).is_ok() {
-                hooked.insert(id, ctl.clone());
-            }
-        }
+    if !hooked.contains_key(id) && ctl.RegisterAudioSessionNotification(events).is_ok() {
+        hooked.insert(id.to_string(), ctl.clone());
     }
     let mut cur = vol.GetMasterVolume().ok()?;
     let want = cfg.0.min(100) as f32 / 100.0;
     if let Some(v) = target(cfg.1, want, cur, once.contains(key)) {
-        if may_correct(key) && vol.SetMasterVolume(v, std::ptr::null()).is_ok() {
+        if may_correct(id) && vol.SetMasterVolume(v, std::ptr::null()).is_ok() {
             cur = v;
         }
     }
@@ -522,9 +624,7 @@ unsafe fn apply(devices: &[Device], hooked: &mut HashMap<String, IAudioSessionCo
         let none = HashSet::new();
         let (once, unmute) = if here { (&once, &unmute) } else { (&none, &none) };
         let rule = |vol: u32, mode: Mode| if here { (vol, mode) } else { (vol, Mode::Off) };
-        let Ok(en) = d.mgr.GetSessionEnumerator() else { continue };
-        for i in 0..en.GetCount().unwrap_or(0) {
-            let Ok(ctl) = en.GetSession(i) else { continue };
+        for (id, ctl) in &d.sessions {
             let Ok(ctl2) = ctl.cast::<IAudioSessionControl2>() else { continue };
             if ctl.GetState().map_or(true, |s| s == AudioSessionStateExpired) {
                 continue;
@@ -533,7 +633,7 @@ unsafe fn apply(devices: &[Device], hooked: &mut HashMap<String, IAudioSessionCo
 
             // Windows' own sounds ("System sounds" in the Volume Mixer)
             if ctl2.IsSystemSoundsSession() == S_OK {
-                if let Some(cur) = enforce(&ctl, &vol, SYSTEM, rule(system.volume, system.mode), once, unmute, hooked, events) {
+                if let Some(cur) = enforce(id, ctl, &vol, SYSTEM, rule(system.volume, system.mode), once, unmute, hooked, events) {
                     let pct = (cur * 100.0).round() as u32;
                     system_now = Some(system_now.map_or(pct, |v| v.max(pct)));
                 }
@@ -548,7 +648,7 @@ unsafe fn apply(devices: &[Device], hooked: &mut HashMap<String, IAudioSessionCo
             // Matched by the start of the name ("medal" also covers MedalEncoder);
             // the most specific row wins, so a helper can still get a row of its own.
             let cur = if let Some(app) = apps.iter().filter(|a| !a.exe.is_empty() && who.exe.starts_with(&a.exe)).max_by_key(|a| a.exe.len()) {
-                let Some(cur) = enforce(&ctl, &vol, &app.exe, rule(app.volume, app.mode), once, unmute, hooked, events) else { continue };
+                let Some(cur) = enforce(id, ctl, &vol, &app.exe, rule(app.volume, app.mode), once, unmute, hooked, events) else { continue };
                 let e = status.entry(app.exe.clone()).or_default();
                 *e = (true, e.1.max((cur * 100.0).round() as u32));
                 // the app's main program (not MedalEncoder) for its icon

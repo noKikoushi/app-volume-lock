@@ -5,8 +5,8 @@
 1 RT_MANIFEST "app.manifest"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     1,0,2,0
-PRODUCTVERSION  1,0,2,0
+FILEVERSION     1,0,3,0
+PRODUCTVERSION  1,0,3,0
 FILEFLAGSMASK   0x3fL
 FILEFLAGS       0x0L
 FILEOS          VOS_NT_WINDOWS32
@@ -19,12 +19,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "nokikoushi"
             VALUE "FileDescription",  "App Volume Lock"
-            VALUE "FileVersion",      "1.0.2"
+            VALUE "FileVersion",      "1.0.3"
             VALUE "InternalName",     "AppVolumeLock"
             VALUE "LegalCopyright",   "Copyright (C) 2026 nokikoushi. GPL-3.0."
             VALUE "OriginalFilename", "AppVolumeLock.exe"
             VALUE "ProductName",      "App Volume Lock"
-            VALUE "ProductVersion",   "1.0.2"
+            VALUE "ProductVersion",   "1.0.3"
         END
     END
     BLOCK "VarFileInfo"
